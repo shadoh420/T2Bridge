@@ -12,7 +12,10 @@
 #include <Windows.h>
 #include <cstdio>
 #include <cmath>
-#include <detours.h>
+#include <cstring>
+#include "../Detours/include/detours.h"
+
+#pragma comment(lib, "../Detours/lib.X86/detours.lib")
 
 #define GET_OFFSET(type, ptr, offset) *((type*)(((unsigned int)(ptr)) + (offset)))
 
@@ -24,6 +27,7 @@ DWORD WINAPI UpdateThread(LPVOID lpParam);
 // Global state
 static char g_GameDataPath[MAX_PATH] = { 0 };
 static bool g_Running = true;
+static HANDLE g_Mutex = NULL;
 
 // Player data
 static float g_PlayerHealth = 1.0f;
@@ -47,6 +51,8 @@ namespace Addresses {
 namespace ValidationOffsets {
     constexpr unsigned int Offset_0x800 = 512 * 4;  // Must be 0 for valid player
     constexpr unsigned int Offset_0x26C = 0x26C;    // Must be non-zero for valid player
+    constexpr unsigned int Namespace = 36;          // Object namespace pointer
+    constexpr unsigned int TeamId = 0x18;           // Team ID within 0x26C struct
 }
 
 // ============================================================================
@@ -58,7 +64,8 @@ static bool g_LastWrittenValid = false;
 
 DWORD WINAPI UpdateThread(LPVOID lpParam) {
     while (g_Running) {
-        // Only write to file if health changed significantly or validity changed
+        WaitForSingleObject(g_Mutex, INFINITE);
+        
         bool healthChanged = (fabs(g_PlayerHealth - g_LastWrittenHealth) > 0.005f);
         bool validChanged = (g_PlayerValid != g_LastWrittenValid);
         
@@ -68,6 +75,7 @@ DWORD WINAPI UpdateThread(LPVOID lpParam) {
             g_LastWrittenValid = g_PlayerValid;
         }
         
+        ReleaseMutex(g_Mutex);
         Sleep(100);
     }
     return 0;
@@ -91,66 +99,36 @@ namespace Hooks {
     PlayerSetRenderPosition_t Original_SetRenderPosition = (PlayerSetRenderPosition_t)Addresses::SetRenderPosition;
     
     void __fastcall Hook_SetRenderPosition(void* thisPlayer, void* edx, void* arg1, void* arg2, void* arg3) {
-        // ALWAYS call original FIRST - critical for game stability
-        Original_SetRenderPosition(thisPlayer, arg1, arg2, arg3);
         
         g_HookCallCount++;
         
-        // Only process every 100th call (reduces overhead)
-        if ((g_HookCallCount % 100) != 0) {
-            return;
-        }
-        
-        // Skip processing if game window is not active (alt-tabbed)
-        if (!IsGameWindowActive()) {
-            g_PlayerValid = false;
-            return;
-        }
-        
-        // Reset validity - must prove valid each time
-        g_PlayerValid = false;
-        
-        // Use SEH for all memory access
-        __try {
-            if (thisPlayer == nullptr) {
-                return;
-            }
+        // Only process every Nth call to reduce overhead
+        if ((g_HookCallCount % 200) == 0 && thisPlayer != nullptr) {
             
-            // Validate pointer range
             unsigned int ptrVal = (unsigned int)thisPlayer;
-            if (ptrVal < 0x00100000 || ptrVal > 0x7FFF0000) {
-                return;
+            if (ptrVal >= 0x00100000 && ptrVal <= 0x7FFF0000) {
+                
+                int val_0x800 = GET_OFFSET(int, thisPlayer, ValidationOffsets::Offset_0x800);
+                unsigned int val_0x26C = GET_OFFSET(unsigned int, thisPlayer, ValidationOffsets::Offset_0x26C);
+                
+                if (val_0x800 == 0 && val_0x26C != 0) {
+                    void* controlFlag = GET_OFFSET(void*, thisPlayer, Offsets::ControlObjectFlag);
+                    
+                    if (controlFlag != nullptr) {
+                        float damage = GET_OFFSET(float, thisPlayer, Offsets::DamageLevel);
+                        
+                        if (damage == damage && damage >= 0.0f && damage <= 1.0f) {
+                            WaitForSingleObject(g_Mutex, INFINITE);
+                            g_PlayerValid = true;
+                            g_PlayerHealth = 1.0f - damage;
+                            ReleaseMutex(g_Mutex);
+                        }
+                    }
+                }
             }
-            
-            // Validate player object: check offset 0x800 == 0 and 0x26C != 0
-            int val_0x800 = GET_OFFSET(int, thisPlayer, ValidationOffsets::Offset_0x800);
-            unsigned int val_0x26C = GET_OFFSET(unsigned int, thisPlayer, ValidationOffsets::Offset_0x26C);
-            
-            if (val_0x800 != 0 || val_0x26C == 0) {
-                return;
-            }
-            
-            // Check control flag to verify this is the local player
-            void* controlFlag = GET_OFFSET(void*, thisPlayer, Offsets::ControlObjectFlag);
-            if (controlFlag == nullptr) {
-                return;
-            }
-            
-            // Read damage
-            float damage = GET_OFFSET(float, thisPlayer, Offsets::DamageLevel);
-            
-            // Validate damage value (check for NaN and range)
-            if (damage != damage || damage < 0.0f || damage > 1.0f) {
-                return;
-            }
-            
-            // All checks passed
-            g_PlayerValid = true;
-            g_PlayerHealth = 1.0f - damage;
         }
-        __except(EXCEPTION_EXECUTE_HANDLER) {
-            g_PlayerValid = false;
-        }
+        
+        Original_SetRenderPosition(thisPlayer, arg1, arg2, arg3);
     }
 }
 
@@ -192,14 +170,55 @@ void InstallHooks() {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach(&(PVOID&)Hooks::Original_SetRenderPosition, Hooks::Hook_SetRenderPosition);
-    DetourTransactionCommit();
+    LONG result = DetourTransactionCommit();
+    
+    // Debug: Create a marker file to indicate hook installation result
+    char filepath[MAX_PATH];
+    snprintf(filepath, MAX_PATH, "%s\\t2bridge_hook_status.txt", g_GameDataPath);
+    FILE* f = fopen(filepath, "w");
+    if (f) {
+        fprintf(f, "Hook install result: %ld\n", result);
+        fprintf(f, "Original ptr: 0x%p\n", Hooks::Original_SetRenderPosition);
+        fclose(f);
+    }
+}
+
+static HWND WaitForGameWindow(int timeoutMs) {
+    int elapsed = 0;
+    const int checkInterval = 100;
+    
+    while (elapsed < timeoutMs) {
+        HWND hwnd = FindWindowA(NULL, "Tribes 2");
+        if (hwnd != NULL) {
+            return hwnd;
+        }
+        Sleep(checkInterval);
+        elapsed += checkInterval;
+    }
+    return NULL;
 }
 
 void OnDLLProcessAttach() {
     FindGameDataPath();
     
-    // Wait for game to initialize
-    Sleep(2000);
+    g_Mutex = CreateMutex(NULL, FALSE, NULL);
+    HWND hwnd = WaitForGameWindow(30000);
+    
+    if (hwnd == NULL) {
+        // Game window never appeared, don't install hooks
+        char filepath[MAX_PATH];
+        snprintf(filepath, MAX_PATH, "%s\\t2bridge_error.txt", g_GameDataPath);
+        FILE* f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "ERROR: Game window not found after 30s timeout\n");
+            fclose(f);
+        }
+        return;
+    }
+    
+    // Additional delay after window exists to let game fully initialize
+    // The render system may not be ready immediately when the window appears
+    Sleep(3000);
     
     InstallHooks();
     
