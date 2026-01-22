@@ -1,0 +1,12 @@
+# Build outputs
+bin/
+obj/
+*.pdb
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Backup files
+*.bak
