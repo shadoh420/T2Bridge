@@ -45,6 +45,79 @@ namespace Offsets {
 // Hook addresses for Tribes 2 (TribesNext compatible)
 namespace Addresses {
     constexpr unsigned int SetRenderPosition = 0x005D98C0;
+    
+    // Console functions (discovered via Ghidra RE)
+    constexpr unsigned int Con_setVariable = 0x00426070;
+    constexpr unsigned int Con_getVariable = 0x004261f0;
+}
+
+// ============================================================================
+// TORQUESCRIPT CONSOLE FUNCTIONS
+// ============================================================================
+
+// Function pointer types for Torque Console functions
+typedef void (__cdecl *Con_setVariable_t)(const char* varName, const char* value);
+typedef const char* (__cdecl *Con_getVariable_t)(const char* varName);
+
+// Function pointers (initialized at runtime)
+static Con_setVariable_t Con_setVariable = (Con_setVariable_t)Addresses::Con_setVariable;
+static Con_getVariable_t Con_getVariable = (Con_getVariable_t)Addresses::Con_getVariable;
+
+// Test function to verify Con::setVariable works
+void TestConsoleFunctions() {
+    char filepath[MAX_PATH];
+    snprintf(filepath, MAX_PATH, "%s\\t2bridge_console_test.txt", g_GameDataPath);
+    FILE* f = fopen(filepath, "w");
+    
+    if (f) {
+        fprintf(f, "=== T2Bridge Console Function Test ===\n\n");
+        
+        // Test 1: Set a variable
+        fprintf(f, "Test 1: Calling Con_setVariable...\n");
+        fprintf(f, "  Address: 0x%08X\n", Addresses::Con_setVariable);
+        
+        __try {
+            Con_setVariable("$T2Bridge::TestVar", "HELLO_FROM_DLL");
+            fprintf(f, "  Result: SUCCESS - No crash!\n\n");
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            fprintf(f, "  Result: CRASHED - Exception occurred!\n\n");
+            fclose(f);
+            return;
+        }
+        
+        // Test 2: Read it back
+        fprintf(f, "Test 2: Calling Con_getVariable...\n");
+        fprintf(f, "  Address: 0x%08X\n", Addresses::Con_getVariable);
+        
+        __try {
+            const char* result = Con_getVariable("$T2Bridge::TestVar");
+            if (result != nullptr) {
+                fprintf(f, "  Result: SUCCESS - Got value: \"%s\"\n\n", result);
+            } else {
+                fprintf(f, "  Result: Got NULL pointer\n\n");
+            }
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            fprintf(f, "  Result: CRASHED - Exception occurred!\n\n");
+            fclose(f);
+            return;
+        }
+        
+        // Test 3: Set the health variable directly (no file IO needed!)
+        fprintf(f, "Test 3: Setting $T2Bridge::DirectHealth...\n");
+        __try {
+            Con_setVariable("$T2Bridge::DirectHealth", "0.9999");
+            fprintf(f, "  Result: SUCCESS!\n");
+            fprintf(f, "  You can now check this in game console with: echo($T2Bridge::DirectHealth);\n\n");
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            fprintf(f, "  Result: CRASHED!\n\n");
+        }
+        
+        fprintf(f, "=== Test Complete ===\n");
+        fclose(f);
+    }
 }
 
 // Validation offsets - these must be valid for a proper player object
@@ -56,11 +129,21 @@ namespace ValidationOffsets {
 }
 
 // ============================================================================
-// UPDATE THREAD - Writes health data to file
+// UPDATE THREAD - Sets TorqueScript variables directly via Con::setVariable
 // ============================================================================
 
 static float g_LastWrittenHealth = -1.0f;
 static bool g_LastWrittenValid = false;
+
+// Update TorqueScript variables directly (no file I/O!)
+void UpdateScriptVariables() {
+    char healthStr[32];
+    snprintf(healthStr, sizeof(healthStr), "%.4f", g_PlayerHealth);
+    
+    // Set variables directly in TorqueScript memory
+    Con_setVariable("$T2Bridge::Health", healthStr);
+    Con_setVariable("$T2Bridge::Valid", g_PlayerValid ? "1" : "0");
+}
 
 DWORD WINAPI UpdateThread(LPVOID lpParam) {
     while (g_Running) {
@@ -70,7 +153,9 @@ DWORD WINAPI UpdateThread(LPVOID lpParam) {
         bool validChanged = (g_PlayerValid != g_LastWrittenValid);
         
         if (healthChanged || validChanged) {
-            WriteDataFile();
+            WriteDataFile();  // Keep file output for legacy autokit script
+            // NOTE: Do NOT call UpdateScriptVariables here - it runs on background thread
+            // and will race with the main thread hook. The hook sets the variables directly.
             g_LastWrittenHealth = g_PlayerHealth;
             g_LastWrittenValid = g_PlayerValid;
         }
@@ -98,6 +183,11 @@ namespace Hooks {
     typedef void(__thiscall* PlayerSetRenderPosition_t)(void*, void*, void*, void*);
     PlayerSetRenderPosition_t Original_SetRenderPosition = (PlayerSetRenderPosition_t)Addresses::SetRenderPosition;
     
+    // Track last values to avoid redundant setVariable calls
+    static float s_LastSetHealth = -1.0f;
+    static bool s_LastSetValid = false;
+    static int s_DebugCounter = 0;
+    
     void __fastcall Hook_SetRenderPosition(void* thisPlayer, void* edx, void* arg1, void* arg2, void* arg3) {
         
         g_HookCallCount++;
@@ -118,10 +208,41 @@ namespace Hooks {
                         float damage = GET_OFFSET(float, thisPlayer, Offsets::DamageLevel);
                         
                         if (damage == damage && damage >= 0.0f && damage <= 1.0f) {
+                            float health = 1.0f - damage;
+                            bool valid = true;
+                            
+                            // Update global state (for legacy file output if needed)
                             WaitForSingleObject(g_Mutex, INFINITE);
-                            g_PlayerValid = true;
-                            g_PlayerHealth = 1.0f - damage;
+                            g_PlayerValid = valid;
+                            g_PlayerHealth = health;
                             ReleaseMutex(g_Mutex);
+                            
+                            // DIRECTLY set TorqueScript variables from the main game thread!
+                            // Only update if value changed significantly
+                            bool healthChanged = (fabs(health - s_LastSetHealth) > 0.005f);
+                            bool validChanged = (valid != s_LastSetValid);
+                            
+                            if (healthChanged || validChanged) {
+                                char healthStr[32];
+                                snprintf(healthStr, sizeof(healthStr), "%.4f", health);
+                                
+                                // DEBUG: Log every call to Con_setVariable
+                                s_DebugCounter++;
+                                if (g_GameDataPath[0] != '\0') {
+                                    char debugPath[MAX_PATH];
+                                    snprintf(debugPath, MAX_PATH, "%s\\t2bridge_debug.txt", g_GameDataPath);
+                                    FILE* df = fopen(debugPath, "a");
+                                    if (df) {
+                                        fprintf(df, "[%d] Calling Con_setVariable: $T2Bridge::Health = \"%s\"\n", s_DebugCounter, healthStr);
+                                        fclose(df);
+                                    }
+                                }
+                                
+                                Con_setVariable("$T2Bridge::Health", healthStr);
+                                Con_setVariable("$T2Bridge::Valid", "1");
+                                s_LastSetHealth = health;
+                                s_LastSetValid = valid;
+                            }
                         }
                     }
                 }
@@ -133,10 +254,12 @@ namespace Hooks {
 }
 
 // ============================================================================
-// DATA FILE OUTPUT
+// LEGACY DATA FILE OUTPUT (kept for debugging, but no longer used)
 // ============================================================================
 
 void WriteDataFile() {
+    // This function is now deprecated - we use Con::setVariable instead!
+    // Keeping it for emergency fallback/debugging only
     if (g_GameDataPath[0] == '\0') return;
     
     char filepath[MAX_PATH];
@@ -160,9 +283,9 @@ void FindGameDataPath() {
     char* lastSlash = strrchr(exePath, '\\');
     if (lastSlash) {
         *lastSlash = '\0';
-        // Write to GameData/base/ so TorqueScript FileObject can find it
-        snprintf(g_GameDataPath, MAX_PATH, "%s\\base", exePath);
-        CreateDirectoryA(g_GameDataPath, NULL);
+        // Write to GameData/ root (same folder as exe)
+        strncpy(g_GameDataPath, exePath, MAX_PATH);
+        g_GameDataPath[MAX_PATH - 1] = '\0';  // Ensure null termination
     }
 }
 
@@ -222,17 +345,37 @@ void OnDLLProcessAttach() {
     
     InstallHooks();
     
-    // Start update thread
+    // Test the console functions we discovered via Ghidra RE
+    // TODO: Remove this test in production builds
+    TestConsoleFunctions();
+    
+    // Start update thread (now uses Con::setVariable directly!)
     CreateThread(NULL, 0, UpdateThread, NULL, 0, NULL);
     
-    // Write initial data file
-    WriteDataFile();
+    // Set initial variable values
+    UpdateScriptVariables();
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
+        
+        // Immediate debug marker - writes to GameData folder before anything else
+        {
+            char markerPath[MAX_PATH];
+            GetModuleFileNameA(NULL, markerPath, MAX_PATH);
+            char* lastSlash = strrchr(markerPath, '\\');
+            if (lastSlash) {
+                strcpy_s(lastSlash + 1, MAX_PATH - (lastSlash - markerPath + 1), "T2BRIDGE_LOADED.txt");
+                FILE* f = fopen(markerPath, "w");
+                if (f) {
+                    fprintf(f, "T2Bridge.dll loaded successfully at DLL_PROCESS_ATTACH\n");
+                    fclose(f);
+                }
+            }
+        }
+        
         CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)OnDLLProcessAttach, NULL, 0, NULL);
         break;
     case DLL_PROCESS_DETACH:

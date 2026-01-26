@@ -36,39 +36,20 @@ $T2Bridge::DataFile = "t2bridge_data.txt";
 // =============================================================================
 
 function T2Bridge_Poll() {
-    %file = new FileObject();
+    // The DLL now sets $T2Bridge::Health and $T2Bridge::Valid directly via Con::setVariable
+    // No need to read from file anymore!
     
-    if (%file.openForRead($T2Bridge::DataFile)) {
+    // Check if DLL has set the Valid flag
+    if ($T2Bridge::Valid $= "1" || $T2Bridge::Valid == 1) {
         $T2Bridge::Connected = true;
         
-        while (!%file.isEOF()) {
-            %line = %file.readLine();
-            
-            if (getSubStr(%line, 0, 1) $= "#")
-                continue;
-            
-            %eq = strstr(%line, "=");
-            if (%eq != -1) {
-                %key = getSubStr(%line, 0, %eq);
-                %val = getSubStr(%line, %eq + 1, 100);
-                
-                if (%key $= "valid")
-                    $T2Bridge::Valid = (%val $= "1");
-                else if (%key $= "health")
-                    $T2Bridge::Health = %val + 0;
-            }
-        }
-        %file.close();
+        // Check if we should use a repair kit
+        if ($AutoKit::Enabled)
+            AutoKit_TryUse();
     } else {
-        $T2Bridge::Connected = false;
-        $T2Bridge::Valid = false;
+        // DLL hasn't set valid yet or player is dead
+        $T2Bridge::Connected = ($T2Bridge::Health !$= "" && $T2Bridge::Health != 1.0);
     }
-    
-    %file.delete();
-    
-    // Check if we should use a repair kit
-    if ($AutoKit::Enabled && $T2Bridge::Connected && $T2Bridge::Valid)
-        AutoKit_TryUse();
     
     // Continue polling
     schedule(100, 0, "T2Bridge_Poll");
