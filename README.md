@@ -99,6 +99,8 @@ T2Bridge/
 
 The current implementation uses file-based IPC (DLL writes to file, script polls file). A cleaner approach would be to find `Con::setVariable()` in Tribes2.exe and call it directly from the DLL to set TorqueScript global variables like `$T2Bridge::Health` in memory. This would eliminate disk I/O and allow exposing more values (energy, velocity, etc.).
 
+STATUS: implemented, no longer relies on file I/O
+
 ## Requirements
 
 - Tribes 2 (TribesNext or similar)
